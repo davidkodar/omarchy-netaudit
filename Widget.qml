@@ -229,7 +229,7 @@ Panel {
       const s = JSON.parse(text)
       if (s && s.error) root.scanError = clip(s.error, 200)
     } catch (e) {}
-    settingsFile.reload()
+    settingsFile.refresh()
   }
 
   // The settings file: one key=value per line, written by the helper.
@@ -279,6 +279,7 @@ Panel {
     id: scanProc
     command: [root.helperPath, "scan"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, true) }
+    onRunningChanged: if (!running) reportFile.refresh()
   }
 
   // The report, the settings and Omarchy's default agent, read straight from
@@ -288,33 +289,54 @@ Panel {
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || homeDir + "/.local/state") + "/netaudit"
   readonly property string configDir: (Quickshell.env("XDG_CONFIG_HOME") || homeDir + "/.config")
 
-  FileView {
+  // A watch can only be attached to a file that exists, and on a new install
+  // none of these files does. So each file is read by a view that is built
+  // afresh, exactly as at start-up, once its file may have appeared: after a
+  // scan or a change of setting, and whenever the popup opens.
+  component Watched: Item {
+    id: watched
+    property string file: ""
+    property bool missing: false
+    signal loaded(string content)
+    signal absent()
+    visible: false
+    function refresh() {
+      if (!missing && viewLoader.item) { viewLoader.item.reload(); return }
+      viewLoader.active = false
+      Qt.callLater(() => { viewLoader.active = true })
+    }
+    Loader {
+      id: viewLoader
+      active: true
+      sourceComponent: FileView {
+        path: watched.file
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: { watched.missing = false; watched.loaded(text()) }
+        onLoadFailed: { watched.missing = true; watched.absent() }
+      }
+    }
+  }
+
+  Watched {
     id: reportFile
-    path: root.stateDir + "/sanitized-report.json"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.take(text(), false)
+    file: root.stateDir + "/sanitized-report.json"
+    onLoaded: content => root.take(content, false)
     // No report file is "no scan yet", not an error.
-    onLoadFailed: root.take("{}", false)
+    onAbsent: root.take("{}", false)
   }
-  FileView {
+  Watched {
     id: settingsFile
-    path: root.configDir + "/netaudit/settings"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.readSettings(text())
-    onLoadFailed: root.readSettings("")
+    file: root.configDir + "/netaudit/settings"
+    onLoaded: content => root.readSettings(content)
+    onAbsent: root.readSettings("")
   }
-  FileView {
+  Watched {
     id: agentFile
-    path: root.configDir + "/omarchy/defaults/agent"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.agentName = root.word(text().trim())
-    onLoadFailed: root.agentName = ""
+    file: root.configDir + "/omarchy/defaults/agent"
+    onLoaded: content => root.agentName = root.word(content.trim())
+    onAbsent: root.agentName = ""
   }
 
   // The background check. The helper does nothing unless watching is on and
@@ -328,7 +350,7 @@ Panel {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, false) }
     onRunningChanged: {
       if (running) return
-      reportFile.reload()
+      reportFile.refresh()
       if (root.scanWanted) { root.scanWanted = false; root.scan() }
     }
   }
@@ -369,7 +391,7 @@ Panel {
   // Opening the popup rereads everything, in case a change was missed.
   onOpenedChanged: {
     if (!opened) { root.showInfo = false; return }
-    reportFile.reload(); settingsFile.reload(); agentFile.reload()
+    reportFile.refresh(); settingsFile.refresh(); agentFile.refresh()
   }
 
   WidgetButton {
