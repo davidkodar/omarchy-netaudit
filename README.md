@@ -98,7 +98,9 @@ All screenshots use made-up results.
 omarchy plugin add https://github.com/davidkodar/omarchy-netaudit.git --enable
 ```
 
-Then click the shield and press **Scan now**.
+Then click the shield and press **Scan now**. A scan takes about ten seconds.
+On a new system the very first one can take up to a minute, while Omarchy
+installs Node.js.
 
 ## Things to know
 

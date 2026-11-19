@@ -497,7 +497,9 @@ Panel {
               Plain {
                 visible: problem.modelData.fix !== ""
                 width: parent.width
-                color: NetCommons.Color.muted
+                // The fix is the line people act on. Some themes make their
+                // muted colour very faint, so it stays in the text colour.
+                opacity: 0.82
                 text: problem.modelData.fix
               }
               // DNS is measured on this computer. A router that encrypts DNS
