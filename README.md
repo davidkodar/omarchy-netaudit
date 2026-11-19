@@ -136,16 +136,12 @@ installs Node.js.
 
 ## Things to know
 
-**UPnP may read "No answer".** Omarchy's firewall drops the router's reply to
-the UPnP search. The audit works without it; the check stays under Not
-measured. To let that one reply through, allow it from your router only,
-replacing the address with your router's:
-
-```sh
-sudo ufw allow in proto udp from 192.168.1.1 port 1900 comment 'UPnP replies from router'
-```
-
-This is the only step that needs administrator rights, and it is optional.
+**UPnP usually reads "No answer".** Omarchy's firewall drops the router's
+reply to the UPnP search, so the check stays under Not measured. That is
+expected: it earns no points and costs none, and every other check works
+without it. This plugin never changes the firewall and never asks for
+administrator rights. Your router's own admin page or app shows whether UPnP
+is on and which ports it has opened.
 
 **DNS is measured on this computer only.** If your router encrypts DNS for the
 whole home, click **My router encrypts it** on the DNS line. Omarchy's own
@@ -213,12 +209,6 @@ best, and a scan that measured under 60% never shows green.
 ```sh
 omarchy plugin remove davidkodar.netaudit
 rm -rf ~/.local/state/netaudit ~/.config/netaudit
-```
-
-If you added the firewall rule:
-
-```sh
-sudo ufw delete allow in proto udp from 192.168.1.1 port 1900
 ```
 
 ## Languages
