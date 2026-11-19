@@ -38,15 +38,25 @@ Panel {
   // report must not wipe it, or an old score would pass for a current one.
   property string scanError: ""
   property string readError: ""
-  readonly property string error: scanError !== "" ? scanError : readError
+  // A setting the helper refused ("scan this network first"); shown until
+  // the owner changes a setting again.
+  property string settingError: ""
+  readonly property string error: settingError !== "" ? settingError : scanError !== "" ? scanError : readError
   readonly property bool scanning: scanProc.running || autoProc.running
   // A scan asked for while the background check is running; started when it ends.
   property bool scanWanted: false
   // Whether the "how to read this" notes are showing in the popup.
   property bool showInfo: false
 
-  readonly property var score: report && report.score ? report.score : null
-  readonly property bool hasScore: score !== null && score.provisional !== null && score.provisional !== undefined
+  // The score as read from disk, kept only when its numbers are numbers.
+  readonly property var score: {
+    const raw = report && report.score ? report.score : null
+    if (!raw || typeof raw !== "object") return null
+    const within = v => typeof v === "number" && isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : null
+    const coverage = within(raw.coverage)
+    return coverage === null ? null : { provisional: within(raw.provisional), coverage: coverage }
+  }
+  readonly property bool hasScore: score !== null && score.provisional !== null
   readonly property var rows: buildRows(report)
   readonly property var lastChange: buildChange(report)
 
@@ -196,7 +206,7 @@ Panel {
     if (!c || !Array.isArray(c.items) || c.items.length === 0) return null
     const when = formatWhen(c.at)
     if (when === "") return null
-    const lines = c.items.slice(0, 3).map(item => {
+    const lines = c.items.slice(0, 3).filter(item => item && typeof item === "object").map(item => {
       const key = word(item.key), from = word(item.from), to = word(item.to)
       return strings.t("change.item").arg(tr("fact." + key, key)).arg(tr("value." + from, from)).arg(tr("value." + to, to))
     })
@@ -206,7 +216,7 @@ Panel {
   // `fromScan` is true for the answer to a scan, false for a plain reread.
   function take(text, fromScan) {
     let parsed = null
-    try { parsed = JSON.parse(text) } catch (e) {}
+    try { if (String(text).length <= 262144) parsed = JSON.parse(text) } catch (e) {}
     const failed = !parsed || typeof parsed !== "object" || parsed.error !== undefined
     if (fromScan) {
       // An answer with an "error" key is a failure even when the text is empty.
@@ -227,7 +237,7 @@ Panel {
   function takeSettings(text) {
     try {
       const s = JSON.parse(text)
-      if (s && s.error) root.scanError = clip(s.error, 200)
+      root.settingError = s && s.error ? clip(s.error, 200) : ""
     } catch (e) {}
     settingsFile.refresh()
   }
@@ -252,19 +262,27 @@ Panel {
 
   function scan() {
     if (scanProc.running) return
+    root.settingError = ""
     // The background check holds the scan lock; queue behind it.
     if (autoProc.running) { root.scanWanted = true; return }
     scanProc.running = true
   }
 
-  // Changes one of the owner's choices; a DNS change is followed by a scan so
-  // the score reflects it at once.
+  // Changes one of the owner's choices. Nothing here scans: a DNS choice
+  // re-scores the saved report, which the file watch then shows.
   function choose(name, value) {
     if (setProc.running) return
-    setProc.rescan = name === "dns"
+    root.settingError = ""
     setProc.command = [root.helperPath, "set", name, value]
     setProc.running = true
   }
+
+  // The network this computer is on now, as a scrambled id; asked when the
+  // popup opens, and answered from this computer's own tables, without
+  // sending anything. The saved report may be from somewhere else.
+  property string currentNetwork: ""
+  readonly property bool otherNetwork: currentNetwork !== "" && report !== null
+    && typeof report.networkId === "string" && report.networkId !== "" && report.networkId !== currentNetwork
 
   function metaLine() {
     if (!report) return strings.t("meta.none")
@@ -347,7 +365,7 @@ Panel {
     command: [root.helperPath, "scan", "auto"]
     // Its answer is the saved report either way, so it is read as a reread:
     // a background failure must not put an error in front of the owner.
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, false) }
+    stdout: StdioCollector { waitForEnd: true }
     onRunningChanged: {
       if (running) return
       reportFile.refresh()
@@ -356,13 +374,23 @@ Panel {
   }
 
   Process {
+    id: netProc
+    command: [root.helperPath, "network"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.currentNetwork = root.word(JSON.parse(text).network) } catch (e) { root.currentNetwork = "" }
+      }
+    }
+  }
+
+  Process {
     id: setProc
-    property bool rescan: false
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         root.takeSettings(text)
-        if (setProc.rescan) root.scan()
+        reportFile.refresh()
       }
     }
   }
@@ -390,8 +418,9 @@ Panel {
   }
   // Opening the popup rereads everything, in case a change was missed.
   onOpenedChanged: {
-    if (!opened) { root.showInfo = false; return }
+    if (!opened) { root.showInfo = false; root.settingError = ""; return }
     reportFile.refresh(); settingsFile.refresh(); agentFile.refresh()
+    if (!netProc.running) netProc.running = true
   }
 
   WidgetButton {
@@ -534,6 +563,13 @@ Panel {
         }
 
         Plain {
+          visible: root.otherNetwork
+          width: content.inner
+          color: root.yellow
+          text: strings.t("note.otherNetwork")
+        }
+
+        Plain {
           visible: root.error !== ""
           width: content.inner
           color: NetCommons.Color.urgent
@@ -594,7 +630,10 @@ Panel {
               // DNS is measured on this computer. A router that encrypts DNS
               // for the whole home is something only the owner knows.
               Link {
-                visible: problem.modelData.id === "dns" && problem.modelData.state === "plaintext-measured"
+                // Only for the network the report is of: a declaration made
+                // while somewhere else would be about the wrong router.
+                visible: problem.modelData.id === "dns" && !root.otherNetwork
+                  && (problem.modelData.state === "plaintext-measured" || problem.modelData.state === "opportunistic")
                 text: strings.t("link.dnsRouter")
                 onActivated: root.choose("dns", "encrypted")
               }

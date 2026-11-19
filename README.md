@@ -72,51 +72,95 @@ All screenshots use made-up results.
 |---|---|
 | SSH, Telnet, web admin, TR-069 remote management | Connects to ports 22, 23, 80 and 7547 on the router and closes at once. Port 443 is tried too, only to see whether an HTTPS admin page exists. |
 | UPnP | Asks the router which port mappings devices have opened. |
-| Wi-Fi security and WPS | Reads the network this computer is joined to. |
+| Wi-Fi security and WPS | Reads the network this computer is joined to, and counts it only when that Wi-Fi belongs to the router being audited. |
 | Wi-Fi channel | Counts other networks on the same channel. |
-| DNS | Reads whether this computer encrypts its lookups, as set under the network icon in the bar. |
+| DNS | Reads whether this computer's resolver encrypts its lookups, and whether it can fall back to unencrypted. |
 
-## What it never does
+## Limits it keeps to
 
-- It only ever looks at this computer's own default gateway, and only when
-  that is a private address reached over cable or Wi-Fi. No option accepts
-  another target, and it refuses to run through a VPN or other tunnel.
-- It cannot know that the network you are on is yours. **Scan now** audits
-  the router of whatever network this computer is on, so press it only on a
-  network you own or are allowed to check. Alerts never scan any network but
-  the one they were switched on for.
-- It never logs in, sends credentials, reads banners or changes a setting.
-- "Reachable" always means reachable from this computer, inside your home. It
-  says nothing about the internet.
-- The saved report holds no network names, hardware addresses, device names
-  or full IP addresses. To tell one network from another it keeps a scrambled
-  id: a salted hash of the router's hardware address, never the address.
+- **One target.** It looks only at the router this computer's traffic really
+  leaves through, as the kernel decides it, and only when that is a private
+  IPv4 address one hop away on a real network card (cable or Wi-Fi). No
+  option accepts another target.
+- **No VPNs, tunnels or virtual networks.** It refuses to run when a default
+  route, or one of the very wide routes VPNs use in its place, IPv4 or IPv6,
+  in any routing table, goes through anything but a real network card: a VPN
+  or tunnel, including ones that look like a cable (tap devices, ZeroTier), a
+  bridge, or a virtual machine network. The route is checked before a scan
+  and again after it, and a scan during which it changed is thrown away. A
+  computer whose own connection runs through a bridge, a bond or a VLAN is
+  refused as well. A phone's USB tethering counts as a network card, and the
+  phone as the router.
+- **Straight to the router.** Every connection starts from this computer's
+  address on the router's link, goes to the router's IP address, ignores
+  proxy settings and follows no redirects.
+- **Only Scan now starts scanning a network.** It audits the router of
+  whatever network this computer is on, and the plugin cannot know that the
+  network is yours, so press it only on a network you own or are allowed to
+  check. Alerts can be switched on only for a network you have already
+  scanned, and never scan any other. The DNS links only re-score the saved
+  report. When the saved report is from a different network than the one you
+  are on, the popup says so, provided it can tell which network that is; the
+  icon in the bar keeps showing the last report either way.
+- **Read-only.** It never logs in, never sends a user name or password, reads
+  no banners and makes no request meant to change a setting. The only UPnP
+  action it sends is the one that reads a port-mapping entry.
+- **"Reachable" means from this computer**, inside your home. It says nothing
+  about the internet.
+- **Nothing identifying is saved.** The report holds no network names,
+  hardware addresses, device names or full IP addresses; it does hold the
+  first three numbers of the router's address. To tell one network from
+  another it keeps a scrambled id, a salted hash of the router's hardware
+  address. The salt is stored beside it, so someone who can read both files
+  could work the address out; both are readable only by you. A network that
+  copies your router's hardware address would be taken for yours.
 
 ## What it sends, and when
 
-Nothing leaves this computer until you press **Scan now**, or switch on
-alerts. Installing the plugin and opening the popup send nothing. While idle
-the widget starts no process at all: it watches its saved report and settings
-files and rereads them when they change.
+Nothing is sent until you press **Scan now**, or switch on alerts. Installing
+the plugin and opening the popup send nothing. While idle the widget starts
+no process at all: it watches its saved report and settings files and rereads
+them when they change. Opening the popup starts the scanner in a mode that
+only reads this computer's own routing and neighbour tables, to see which
+network it is on. That sends nothing; the first time, it creates the `salt`
+file described under "Files it keeps".
 
-One scan sends, all to your own router and nowhere else:
+One scan sends:
 
-- up to three connection attempts to each of ports 22, 23, 80, 443 and 7547,
-  closed as soon as they connect;
-- a UPnP search to the local multicast address `239.255.255.250:1900`, sent a
-  few times, and, only if the router answers, one request for its description
-  and one request per port-mapping entry.
+- to the router: up to three connection attempts to each of ports 22, 23, 80,
+  443 and 7547, closed as soon as they connect;
+- to the local network: a UPnP search to the multicast address
+  `239.255.255.250:1900`, sent a few times. Every device on the local network
+  can see it; it does not leave the local network;
+- to the router, only if it answers that search: one request for its UPnP
+  description, and one request per port-mapping entry.
 
-A scan also asks NetworkManager for its list of nearby Wi-Fi networks, which
-can make the Wi-Fi card rescan. Nothing in a scan contacts the internet.
+The description's address comes from the router's reply to the search, and
+any device on your network could forge that reply. The scanner therefore
+accepts only a plain address on the router itself (no credentials, no query
+string, port 80 or an unprivileged port) and reads the result only if it is
+a UPnP description. A forged reply can still make it fetch another plain page
+from the router. A router whose UPnP address does not have that plain form is
+listed as not measured.
 
-With alerts on, the same scan runs about every 30 minutes while the bar is
-running, and only on the network you switched them on for. On any other
-network, such as a cafe or an office, the background check does nothing.
+**Scan now** also asks NetworkManager for a fresh list of nearby Wi-Fi
+networks, which makes the Wi-Fi card look for them, as opening the Wi-Fi menu
+does. The background check uses the list NetworkManager already has and
+causes no such search. A scan contacts nothing on the internet, with
+one exception: on a system where Node.js has never been used, the first
+**Scan now** makes Omarchy's tool manager (mise) download and install Node.js.
+Only Scan now can do that; the popup, the DNS links and the background check
+use Node.js only if it is already installed.
+
+With alerts on, a scan runs about every 30 minutes while the bar is running,
+and only on the network you switched them on for. It sends the same as Scan
+now, except that it uses the Wi-Fi list NetworkManager already has. On any other
+network, such as a cafe or an office, the background check sends nothing: it
+looks at the local tables, sees another network and stops.
 
 **Explain** and **Ask …** open your default coding agent in a terminal. From
-then on the agent talks to its own provider as it always does, and it is
-given the saved report to read.
+then on the agent talks to its own provider as it always does. It is given a
+copy of the saved report, without the network id.
 
 ## Requirements
 
@@ -143,26 +187,37 @@ without it. This plugin never changes the firewall and never asks for
 administrator rights. Your router's own admin page or app shows whether UPnP
 is on and which ports it has opened.
 
-**DNS is measured on this computer only.** If your router encrypts DNS for the
-whole home, click **My router encrypts it** on the DNS line. Omarchy's own
-Cloudflare and Google settings count as encrypted. "Opportunistic" encryption
-with whatever DNS servers the network handed out does not, because it falls
-back to unencrypted without saying so.
+**DNS is measured on this computer only**, from what systemd-resolved reports
+about itself, and only strict DNS over TLS on every link and server that
+report shows in use counts as encrypted. Omarchy's
+Cloudflare and Google settings use the opportunistic mode, which encrypts
+when the server allows it but can fall back to unencrypted without saying so;
+that is listed as "Can fall back" and earns half the points. Where programs
+bypass systemd-resolved (a `resolv.conf` that is not its stub), DNS is listed
+as not measured. If your router encrypts DNS for the whole home, click **My
+router encrypts it** on the DNS line. That is your statement, not a
+measurement; it is about the network the report is of, applies only on that
+network, and clicking it does not scan anything.
 
 **The agent buttons start your default agent the way Omarchy does**: in a
-terminal, in its auto-approve mode, in a folder that holds only the report.
-The prompt tells it to read the report and change nothing, but that is an
-instruction, not a lock. If no default agent is set, the button opens
-Omarchy's picker.
+terminal, in its auto-approve mode, with your own rights. It starts in a new
+folder that holds a copy of the report and nothing else. The prompt tells it
+to read the report as data and change nothing, but that is an instruction,
+not a lock. If no default agent is set, the button opens Omarchy's picker.
 
 **Alerts are off until you switch them on.** When on, the widget rescans
 about every 30 minutes and sends a desktop notification if a check changed.
-Alerts belong to the network you were on when you switched them on; to move
-them to another network, switch them off and on again there.
+Alerts belong to the network you were on when you switched them on, and can
+only be switched on for a network you have scanned. To move them to another
+network, scan there, then switch them off and on again.
 
-**"Not measured" is never a pass.** If the router does not answer at all, its
-ports are listed as not measured, and a UPnP search that gets no reply is not
-taken to mean UPnP is off. Neither earns points, and neither raises an alert.
+**"Not measured" is never a pass.** If the router gives no sign of life during
+a scan, its ports are listed as not measured. (A router that stopped
+answering within the last half minute or so can still count as present,
+because the system remembers its last answer for that long.) A UPnP search that
+gets no reply is not taken to mean UPnP is off, and a port-mapping table that
+could not be read to its end is not taken to be empty. None of these earns
+points or raises an alert.
 
 ## Settings
 
@@ -189,9 +244,9 @@ and the popup shows how much of the evidence was known.
 |---|---|---|
 | SSH, Telnet, web admin, TR-069 | 6, 10, 4, 10 | not reachable |
 | UPnP | 20 | 10 when on with no mappings, 0 with mappings; not counted when it does not answer |
-| Wi-Fi security | 20 | WPA2 or WPA3 |
+| Wi-Fi security | 20 | WPA2 or WPA3 only; a network that still accepts the first WPA, WEP or no password gets none |
 | Wi-Fi channel | 10 | no neighbours; 5 for one or two |
-| DNS | 20 | encrypted |
+| DNS | 20 | encrypted (strict); 10 when it can fall back to unencrypted |
 
 Good is 85 and up, Fair 70 to 84, Needs attention 50 to 69, At risk below 50.
 One serious finding always shows red, one moderate finding shows orange at
@@ -201,8 +256,8 @@ best, and a scan that measured under 60% never shows green.
 
 | Path | What |
 |---|---|
-| `~/.local/state/netaudit/` | The latest report, the one before it, and a random `salt` used to scramble the network id |
-| `~/.config/netaudit/settings` | Your choices (DNS declared by you, alerts on or off) and the scrambled id of the network alerts are for |
+| `~/.local/state/netaudit/` | The latest report, the one before it, a random `salt` used to scramble the network id, and a `lock` file that keeps two scans from running at once |
+| `~/.config/netaudit/settings` | Your choices (DNS declared by you, alerts on or off) and the scrambled ids of the networks they apply to |
 
 ## Remove
 
@@ -210,6 +265,14 @@ best, and a scan that measured under 60% never shows green.
 omarchy plugin remove davidkodar.netaudit
 rm -rf ~/.local/state/netaudit ~/.config/netaudit
 ```
+
+If the first Scan now installed Node.js, it stays: it is Omarchy's own copy,
+kept by mise under `~/.local/share/mise/installs/node`, and other tools use
+it too.
+
+Each use of Explain or Ask leaves a small `netaudit-explain.*` folder holding
+a copy of the report in your session's runtime directory, which the system
+clears when you log out (in `/tmp` if the session has no runtime directory).
 
 ## Languages
 
@@ -225,7 +288,9 @@ node --test tests/
 omarchy plugin validate .
 ```
 
-The scanner also runs by itself: `node scanner/scanner.mjs --help`.
+The scanner also runs by itself: `node scanner/scanner.mjs --help`. Run by
+hand it keeps to the same limits, but unlike the widget's helper it has no
+overall time limit and takes no lock.
 
 ## License
 

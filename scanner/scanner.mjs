@@ -20,6 +20,14 @@ import { pathToFileURL } from 'node:url';
 
 // Reports live in the owner's state folder, outside the plugin, so a plugin
 // update never touches them and they are never committed by accident.
+// Nothing this program sends may go through a proxy: every request is to the
+// router on the local link. The helper starts it without these variables;
+// they are dropped here too, for anyone running it by hand.
+for (const name of ['http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_USE_ENV_PROXY']) {
+  delete process.env[name];
+  delete process.env[name.toUpperCase()];
+}
+
 const STATE_DIR = process.env.NETAUDIT_STATE_DIR
   || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'netaudit');
 const REPORT = path.join(STATE_DIR, 'sanitized-report.json');
@@ -44,7 +52,7 @@ const DNS_CHOICES = ['auto', 'encrypted', 'plaintext', 'unknown'];
 // ---------- arguments ----------
 
 function parseArgs(argv) {
-  const opts = { dns: 'auto', watch: false, minutes: 30, quiet: false, notify: false, maxAge: 0, onlyNetwork: '', printNetwork: false };
+  const opts = { dns: 'auto', watch: false, minutes: 30, quiet: false, notify: false, maxAge: 0, onlyNetwork: '', printNetwork: false, dnsNetwork: '', rescore: false, cachedWifi: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--dns') {
@@ -60,6 +68,13 @@ function parseArgs(argv) {
     } else if (arg === '--only-network') {
       opts.onlyNetwork = String(argv[++i] ?? '');
       if (!/^[0-9a-f]{16}$/.test(opts.onlyNetwork)) throw new Error('--only-network needs a network id');
+    } else if (arg === '--dns-network') {
+      opts.dnsNetwork = String(argv[++i] ?? '');
+      if (!/^[0-9a-f]{16}$/.test(opts.dnsNetwork)) throw new Error('--dns-network needs a network id');
+    } else if (arg === '--cached-wifi') {
+      opts.cachedWifi = true;
+    } else if (arg === '--rescore') {
+      opts.rescore = true;
     } else if (arg === '--network-id') {
       opts.printNetwork = true;
     } else if (arg === '--quiet') {
@@ -71,11 +86,15 @@ function parseArgs(argv) {
         'Usage: node scanner.mjs [options]',
         '',
         '  --dns <auto|encrypted|plaintext|unknown>',
-        '                 auto (default) reads this computer\'s resolver; the others',
-        '                 declare what you know, e.g. that the router encrypts DNS.',
+        '                 auto (default) reads this computer\'s resolver; encrypted and',
+        '                 plaintext declare what you know of one network\'s router',
+        '                 and need --dns-network.',
         '  --watch [min]  Rerun every N minutes (default 30) and print what changed.',
         '  --max-age <min>  Do nothing if the saved report is newer than this.',
         '  --notify       Send a desktop notification when a check changed.',
+        '  --dns-network <id>  Apply a declared --dns only on that network.',
+        '  --rescore      Apply --dns to the saved report without scanning anything.',
+        '  --cached-wifi  Use the Wi-Fi list NetworkManager already has; do not rescan.',
         '  --network-id   Print a scrambled id of the network this computer is on.',
         '  --only-network <id>  Do nothing unless this computer is on that network.',
         '  --quiet        Print nothing but errors.',
@@ -87,6 +106,10 @@ function parseArgs(argv) {
     } else {
       throw new Error(`Unknown option: ${arg} (this tool accepts no target or host)`);
     }
+  }
+  // A declaration is about one network; it has to say which.
+  if ((opts.dns === 'encrypted' || opts.dns === 'plaintext') && !opts.dnsNetwork) {
+    throw new Error(`--dns ${opts.dns} needs --dns-network <id>; --network-id prints the id of this network`);
   }
   return opts;
 }
@@ -110,36 +133,104 @@ function isPrivateGateway(ip) {
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
-// The default gateway and the interface it is reached through, from the
-// kernel's routing table. With several default routes (cable and Wi-Fi
-// together) the one with the lowest metric is in use.
-async function findRoute() {
-  const routes = (await run('ip', ['-4', 'route', 'show', 'default']))
-    .split('\n')
-    .map((line) => ({
-      via: /\bvia (\S+)/.exec(line)?.[1],
-      dev: /\bdev (\S+)/.exec(line)?.[1] ?? '',
-      metric: Number(/\bmetric (\d+)/.exec(line)?.[1] ?? 0),
-    }))
-    .filter((route) => route.via)
-    .sort((a, b) => a.metric - b.metric);
-  const route = routes[0];
-  if (!isPrivateGateway(route?.via)) {
-    throw new Error('Safety stop: the default gateway is missing or is not a private IPv4 address.');
-  }
-  // A VPN or other tunnel also has a private "gateway", but it is somebody
-  // else's server, not a home router. Only cable and Wi-Fi links are audited.
-  if (!isHomeLink(route.dev)) {
-    throw new Error('Safety stop: the default route goes through a VPN or tunnel, not a home router.');
-  }
-  return { gateway: route.via, dev: route.dev };
+// Two addresses used only as questions to the kernel: "which way would
+// traffic to the internet go?". One sits in each half of the address space,
+// because a VPN can take over the internet with two half-routes instead of a
+// default route. Nothing is ever sent to either.
+const ROUTE_PROBES = ['1.1.1.1', '192.0.2.1'];
+
+// Reads one answer of `ip route get`.
+function parseRouteGet(text) {
+  const line = String(text).split('\n')[0] ?? '';
+  return {
+    via: /\bvia (\S+)/.exec(line)?.[1] ?? '',
+    dev: /\bdev (\S+)/.exec(line)?.[1] ?? '',
+    src: /\bsrc (\S+)/.exec(line)?.[1] ?? '',
+  };
 }
 
-// True for Ethernet-type links (cable and Wi-Fi), false for tun, WireGuard,
-// PPP and the like.
-function isHomeLink(dev) {
+// The devices of every route that can carry internet traffic, in every
+// routing table: default routes, and the half-routes (0.0.0.0/1, 128.0.0.0/1,
+// ::/1, 8000::/1) some VPNs use in their place. A VPN often keeps these in a
+// table of its own, selected by a policy rule, where the ordinary table still
+// shows the cable.
+function defaultRouteDevices(text) {
+  const devices = [];
+  let wide = false;
+  for (const raw of String(text).split('\n')) {
+    // The next hops of a multipath route are listed on lines of their own.
+    if (/^\s+nexthop\b/.test(raw)) {
+      const dev = /\bdev (\S+)/.exec(raw)?.[1];
+      if (wide && dev) devices.push(dev);
+      continue;
+    }
+    const words = raw.trim().split(/\s+/);
+    // Routes that carry nothing ("unreachable default", "blackhole ...").
+    if (['unreachable', 'blackhole', 'prohibit', 'throw'].includes(words[0])) { wide = false; continue; }
+    const target = ['unicast', 'local', 'broadcast', 'multicast', 'anycast', 'nat'].includes(words[0]) ? words[1] : words[0];
+    // "Wide" is the default route or any prefix of three bits or fewer:
+    // 0.0.0.0/1 and 128.0.0.0/1, the /2 quarters, ::/1, 8000::/1, 2000::/3.
+    const length = /\/(\d+)$/.exec(target ?? '')?.[1];
+    wide = target === 'default' || (length !== undefined && Number(length) <= 3);
+    if (!wide) continue;
+    const dev = /\bdev (\S+)/.exec(raw)?.[1];
+    if (dev) devices.push(dev);
+  }
+  return devices;
+}
+
+// The router traffic really leaves through, as the kernel decides it, policy
+// rules included, and this computer's own address on that link. Stops unless
+// the way out is a private router one hop away on a real network card, and no
+// VPN or tunnel carries internet traffic in any routing table, IPv4 or IPv6.
+async function findRoute() {
+  const answers = [];
+  for (const probe of ROUTE_PROBES) answers.push(parseRouteGet(await run('ip', ['-4', '-o', 'route', 'get', probe])));
+  const out = answers[0];
+  if (!out.dev) throw new Error('Safety stop: this computer has no route to the internet.');
+  if (answers.some((a) => a.via !== out.via || a.dev !== out.dev)) {
+    throw new Error('Safety stop: traffic is split between routes, as a VPN does, so the audit will not run.');
+  }
+  if (!out.via || !isHomeLink(out.dev)) {
+    throw new Error('Safety stop: traffic leaves through a VPN, a tunnel or a virtual network, not a home router.');
+  }
+  if (!isPrivateGateway(out.via)) {
+    throw new Error('Safety stop: the default gateway is not a private IPv4 address.');
+  }
+  const carriers = [
+    ...defaultRouteDevices(await run('ip', ['-4', 'route', 'show', 'table', 'all'])),
+    ...defaultRouteDevices(await run('ip', ['-6', 'route', 'show', 'table', 'all'])),
+  ];
+  if (carriers.some((dev) => dev !== 'lo' && !isHomeLink(dev))) {
+    throw new Error('Safety stop: a VPN, a tunnel or a virtual network carries internet traffic, so the audit will not run.');
+  }
+  // The router has to be a direct neighbour on that same link, also for
+  // traffic sent from the address the scan will use.
+  const hop = parseRouteGet(await run('ip', ['-4', '-o', 'route', 'get', out.via]));
+  if (hop.via || hop.dev !== out.dev || !net.isIPv4(hop.src)) {
+    throw new Error('Safety stop: the default gateway is not directly reachable on the local link.');
+  }
+  const bound = parseRouteGet(await run('ip', ['-4', '-o', 'route', 'get', out.via, 'from', hop.src]));
+  if (bound.via || bound.dev !== out.dev) {
+    throw new Error('Safety stop: traffic from this computer\'s address would not go straight to the gateway.');
+  }
+  return { gateway: out.via, dev: out.dev, src: hop.src };
+}
+
+// True only for a real network card: a cable or Wi-Fi adapter. Tunnels are
+// not (tun, WireGuard, PPP), and neither are the virtual Ethernet devices a
+// VPN or a virtual machine can present, which look like a cable to most
+// checks (tap devices, bridges, veth, VXLAN, ZeroTier): those have no
+// hardware device behind them.
+function isHomeLink(dev, root = '/sys/class/net') {
   if (!/^[A-Za-z0-9_.-]{1,32}$/.test(dev)) return false;
-  try { return fs.readFileSync(`/sys/class/net/${dev}/type`, 'utf8').trim() === '1'; } catch { return false; }
+  const at = path.join(root, dev);
+  try {
+    if (fs.readFileSync(path.join(at, 'type'), 'utf8').trim() !== '1') return false;
+    if (fs.existsSync(path.join(at, 'tun_flags'))) return false;
+    if (fs.existsSync(path.join(at, 'bridge')) || fs.existsSync(path.join(at, 'bonding'))) return false;
+    return fs.existsSync(path.join(at, 'device'));
+  } catch { return false; }
 }
 
 // The gateway's entry in the neighbour table: whether the router has answered
@@ -148,7 +239,8 @@ function isHomeLink(dev) {
 async function gatewayNeighbour(gateway, dev) {
   const line = (await run('ip', ['neigh', 'show', gateway, 'dev', dev])).split('\n')[0] ?? '';
   const mac = /\blladdr ([0-9a-f:]{17})\b/i.exec(line)?.[1]?.toLowerCase() ?? '';
-  return { mac, alive: Boolean(mac) && !/\b(FAILED|INCOMPLETE)\b/.test(line) };
+  const state = /\b(REACHABLE|STALE|DELAY|PROBE|FAILED|INCOMPLETE|PERMANENT|NOARP)\b/.exec(line)?.[1] ?? '';
+  return { mac, state };
 }
 
 // A scrambled id for "this network": a salted hash of the router's hardware
@@ -157,21 +249,26 @@ async function gatewayNeighbour(gateway, dev) {
 // computer.
 function networkId(mac) {
   if (!mac) return '';
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   const saltFile = path.join(STATE_DIR, 'salt');
-  let salt = '';
-  try { salt = fs.readFileSync(saltFile, 'utf8').trim(); } catch { /* made below */ }
+  const read = () => { try { return fs.readFileSync(saltFile, 'utf8').trim(); } catch { return ''; } };
+  let salt = read();
   if (!/^[0-9a-f]{32}$/.test(salt)) {
-    salt = crypto.randomBytes(16).toString('hex');
-    fs.writeFileSync(saltFile, `${salt}\n`, { mode: 0o600 });
+    // "wx" fails if another run made the file first; then theirs is used. A
+    // file that is there but damaged is replaced.
+    const fresh = `${crypto.randomBytes(16).toString('hex')}\n`;
+    try { fs.writeFileSync(saltFile, fresh, { mode: 0o600, flag: 'wx' }); } catch { /* it exists */ }
+    salt = read();
+    if (!/^[0-9a-f]{32}$/.test(salt)) {
+      try {
+        fs.writeFileSync(`${saltFile}.${process.pid}.tmp`, fresh, { mode: 0o600 });
+        fs.renameSync(`${saltFile}.${process.pid}.tmp`, saltFile);
+      } catch { return ''; }
+      salt = read();
+      if (!/^[0-9a-f]{32}$/.test(salt)) return '';
+    }
   }
   return crypto.createHash('sha256').update(`${salt}:${mac}`).digest('hex').slice(0, 16);
-}
-
-// This computer's own address on the way to the gateway. Used only to tell
-// whether a port mapping points here; it is never stored.
-async function localAddressFor(gateway) {
-  return /\bsrc (\S+)/.exec(await run('ip', ['-4', 'route', 'get', gateway]))?.[1] ?? '';
 }
 
 // ---------- checks ----------
@@ -179,15 +276,30 @@ async function localAddressFor(gateway) {
 // Connect, then close at once. Nothing is sent or read. Resolves with how
 // the attempt ended: 'open', 'refused' (the router answered "closed"),
 // 'timeout' (no answer) or 'error' (the attempt never reached the router).
-function probePort(host, port) {
+function probePort(host, port, localAddress) {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
+    const socket = net.createConnection({ host, port, localAddress });
     const done = (outcome) => { socket.destroy(); resolve(outcome); };
     socket.setTimeout(800);
     socket.once('connect', () => done('open'));
     socket.once('timeout', () => done('timeout'));
     socket.once('error', (error) => done(error.code === 'ECONNREFUSED' ? 'refused' : 'error'));
   });
+}
+
+// Whether the router is answering this computer right now. The attempts made
+// the kernel look for it: REACHABLE means it has just answered. STALE is a
+// memory of an old answer, and DELAY and PROBE mean the kernel is still
+// asking, so those are waited on, for longer than the kernel takes to give
+// up, and count only if they end in an answer.
+async function routerAnswers(gateway, dev, waitMs = 8000) {
+  const until = Date.now() + waitMs;
+  for (;;) {
+    const { state } = await gatewayNeighbour(gateway, dev);
+    if (state === 'REACHABLE') return true;
+    if (!['STALE', 'DELAY', 'PROBE'].includes(state) || Date.now() >= until) return false;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
 }
 
 // What the attempts say about each port. Silence only means "closed" when
@@ -206,19 +318,22 @@ function classifyPorts(outcomes, routerAlive) {
   return result;
 }
 
-async function checkPorts(gateway, routerAlive) {
+async function checkPorts({ gateway, dev, src }) {
   const outcomes = {};
   await Promise.all([...PORTS.map((p) => p.port), HTTPS_PORT].map(async (port) => {
     // A single missed connection is not evidence that a port is closed, so
     // an attempt without a clear answer is repeated, three in all.
     let outcome = 'error';
     for (let attempt = 0; attempt < 3; attempt++) {
-      outcome = await probePort(gateway, port);
+      outcome = await probePort(gateway, port, src);
       if (outcome === 'open' || outcome === 'refused') break;
     }
     outcomes[port] = outcome;
   }));
-  return classifyPorts(outcomes, routerAlive);
+  // Silence is only a closed port if the router is there. One clear answer on
+  // any port settles that; without one, the kernel is asked.
+  const answered = Object.values(outcomes).some((o) => o === 'open' || o === 'refused');
+  return classifyPorts(outcomes, answered || await routerAnswers(gateway, dev));
 }
 
 // ----- UPnP -----
@@ -240,10 +355,28 @@ const MAPPING_SERVICES = [
 ];
 const MAX_MAPPINGS = 200;
 
+// The address of a UPnP description or control point, accepted only in its
+// plainest form: http, the router's own IP address, port 80 or an
+// unprivileged port, and a path made of ordinary characters. A reply to the
+// search can be forged by any device on the network, so nothing in it may
+// carry a user name, a password, a query string or a fragment: the scanner
+// must not be steerable into sending the router a request of someone else's
+// design.
+function routerUrl(text, gateway, base) {
+  let url;
+  try { url = base ? new URL(String(text), base) : new URL(String(text)); } catch { return null; }
+  const port = Number(url.port || 80);
+  if (url.protocol !== 'http:' || url.hostname !== gateway) return null;
+  if (url.username || url.password || url.search || url.hash) return null;
+  if (port !== 80 && (port < 1024 || port > 65535)) return null;
+  if (!/^\/[A-Za-z0-9_.~:\/-]{0,200}$/.test(url.pathname) || url.pathname.includes('..')) return null;
+  return url.href;
+}
+
 // Searches for an internet gateway. Resolves with the description URL the
 // gateway itself announced, 'other' when only some other device answered, or
 // null when nothing did.
-function discoverGateway(gateway, waitMs = 4000) {
+function discoverGateway(gateway, src, waitMs = 4000) {
   return new Promise((resolve) => {
     const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
     const timers = [];
@@ -266,14 +399,15 @@ function discoverGateway(gateway, waitMs = 4000) {
     };
     socket.on('error', () => finish(sawOther ? 'other' : null));
     socket.on('message', (data, remote) => {
-      const location = /^location:\s*(\S+)/im.exec(data.subarray(0, 4096).toString('latin1'))?.[1];
-      let host = null;
-      try { host = new URL(location).hostname; } catch { /* not a usable answer */ }
+      const location = /^location:[ \t]*(\S{1,300})/im.exec(data.subarray(0, 4096).toString('latin1'))?.[1];
       // Only the gateway's own answer, pointing back at the gateway, counts.
-      if (remote.address === gateway && host === gateway && /^http:/i.test(location)) finish(location);
+      const url = remote.address === gateway ? routerUrl(location, gateway) : null;
+      if (url) finish(url);
       else sawOther = true;
     });
-    socket.bind(0, () => {
+    socket.bind(0, src, () => {
+      // The search leaves through the router's link and no other.
+      try { socket.setMulticastInterface(src); } catch { finish(null); return; }
       // UDP loses packets, so the search goes out a few times.
       search();
       for (const delay of [300, 900, 1800]) timers.push(setTimeout(search, delay));
@@ -285,16 +419,23 @@ function discoverGateway(gateway, waitMs = 4000) {
 // One HTTP request to the gateway. It always settles: on a complete answer,
 // an error, a connection closed mid-answer, an answer that is too large, or
 // after six seconds whatever the router is doing.
-function request(url, { method = 'GET', headers = {}, body } = {}) {
+//
+// It uses an agent of its own, which knows nothing of proxies, starts from
+// this computer's address on the router's link, and gives up if the machine
+// it finds itself connected to is not the one in the URL.
+const DIRECT = new http.Agent({ keepAlive: false });
+
+function request(url, { method = 'GET', headers = {}, body, localAddress } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const settle = (fn, value) => { if (!settled) { settled = true; clearTimeout(deadline); fn(value); } };
-    const req = http.request(url, { method, headers }, (res) => {
+    const expected = new URL(url).hostname;
+    const req = http.request(url, { method, headers, agent: DIRECT, localAddress }, (res) => {
       const chunks = [];
       let size = 0;
       res.on('data', (chunk) => {
         size += chunk.length;
-        if (size > 512 * 1024) { req.destroy(); settle(reject, new Error('response too large')); return; }
+        if (size > 128 * 1024) { req.destroy(); settle(reject, new Error('response too large')); return; }
         chunks.push(chunk);
       });
       res.on('end', () => (res.complete
@@ -305,32 +446,98 @@ function request(url, { method = 'GET', headers = {}, body } = {}) {
       res.on('close', () => settle(reject, new Error('response cut short')));
     });
     const deadline = setTimeout(() => { req.destroy(); settle(reject, new Error('timeout')); }, 6000);
+    req.on('socket', (socket) => socket.once('connect', () => {
+      if (socket.remoteAddress !== expected) { req.destroy(); settle(reject, new Error('not connected to the router')); }
+    }));
     req.on('error', (error) => settle(reject, error));
     if (body) req.write(body);
     req.end();
   });
 }
 
+// The text of the first <tag>…</tag> in a piece of XML, with or without a
+// namespace prefix. Written with plain searches, not a pattern: the XML comes
+// from the router, and a pattern can be made to take minutes on hostile input.
+// Lower case for ASCII letters only, so that positions in the folded text
+// are positions in the original (some other letters change length).
+function asciiLower(text) {
+  return String(text).replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
+}
+
+// XML with its comments removed, so that a commented-out value is not read.
+function withoutComments(xml) {
+  const text = String(xml);
+  let out = '';
+  let from = 0;
+  for (;;) {
+    const start = text.indexOf('<!--', from);
+    if (start < 0) return out + text.slice(from);
+    out += text.slice(from, start);
+    const end = text.indexOf('-->', start + 4);
+    if (end < 0) return out;
+    from = end + 3;
+  }
+}
+
 function xmlValue(xml, tag) {
-  return new RegExp(`<(?:\\w+:)?${tag}\\b[^>]*>([^<]*)</(?:\\w+:)?${tag}>`, 'i').exec(xml)?.[1]?.trim() ?? '';
+  const text = withoutComments(xml);
+  const lower = asciiLower(text);
+  const name = asciiLower(tag);
+  let from = 0;
+  for (;;) {
+    const at = lower.indexOf(name, from);
+    if (at < 0) return '';
+    from = at + name.length;
+    // "<name" or "<prefix:name", then the end of the name.
+    const before = lower.slice(Math.max(0, at - 33), at);
+    if (!/<(?:[a-z0-9_-]{1,31}:)?$/.test(before)) continue;
+    const next = lower[from];
+    if (next !== '>' && next !== ' ' && next !== '\t' && next !== '\n' && next !== '\r') continue;
+    const open = lower.indexOf('>', from);
+    if (open < 0) return '';
+    if (text.startsWith('<![CDATA[', open + 1)) {
+      const end = text.indexOf(']]>', open + 10);
+      return end < 0 ? '' : text.slice(open + 10, end).trim();
+    }
+    const close = lower.indexOf('<', open + 1);
+    if (close < 0) return '';
+    return text.slice(open + 1, close).trim();
+  }
+}
+
+// The <service>…</service> blocks of a description, found the same way.
+function serviceBlocks(description) {
+  const text = withoutComments(description);
+  const lower = asciiLower(text);
+  const blocks = [];
+  let from = 0;
+  while (blocks.length < 64) {
+    const start = lower.indexOf('<service>', from);
+    if (start < 0) break;
+    const end = lower.indexOf('</service>', start);
+    if (end < 0) break;
+    blocks.push(text.slice(start, end));
+    from = end + 10;
+  }
+  return blocks;
 }
 
 // The control URL of the gateway's port-mapping service, from its description.
 function findMappingService(description, location, gateway) {
-  for (const block of description.match(/<service>[\s\S]*?<\/service>/gi) ?? []) {
+  for (const block of serviceBlocks(description)) {
     const type = xmlValue(block, 'serviceType');
     if (!MAPPING_SERVICES.includes(type)) continue;
-    const base = xmlValue(description, 'URLBase') || location;
-    let control;
-    try { control = new URL(xmlValue(block, 'controlURL'), base); } catch { continue; }
-    // Never follow a description that points anywhere but the gateway.
-    if (control.hostname !== gateway || control.protocol !== 'http:') continue;
-    return { type, control: control.href };
+    // Never follow a description that points anywhere but the gateway, and
+    // only to an address of the same plain form as the description's own.
+    const base = routerUrl(xmlValue(description, 'URLBase') || location, gateway);
+    const control = base ? routerUrl(xmlValue(block, 'controlURL'), gateway, base) : null;
+    if (!control) continue;
+    return { type, control };
   }
   return null;
 }
 
-async function readMapping(service, index) {
+async function readMapping(service, index, localAddress) {
   const body = `<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body><u:GetGenericPortMappingEntry xmlns:u="${service.type}"><NewPortMappingIndex>${index}</NewPortMappingIndex></u:GetGenericPortMappingEntry></s:Body>
@@ -343,34 +550,45 @@ async function readMapping(service, index) {
       SOAPAction: `"${service.type}#GetGenericPortMappingEntry"`,
     },
     body,
+    localAddress,
   });
 }
 
 // Reads the whole port-mapping table, sanitized. Resolves with null when the
 // table could not be read at all.
-async function readMappingTable(service, here, budgetMs = 20000) {
+async function readMappingTable(service, here, budgetMs = 20000, localAddress = undefined) {
   const mappings = [];
   const started = Date.now();
-  let lastSeen = '';
+  const seen = new Set();
   for (let index = 0; index < MAX_MAPPINGS; index++) {
     // A table that cannot be read in the time allowed is not a table.
     if (Date.now() - started > budgetMs) return null;
-    const reply = await readMapping(service, index);
+    const reply = await readMapping(service, index, localAddress);
     if (reply.status !== 200) {
-      // A router ends its table with a fault. Routers disagree on which (713,
-      // 714, 402, 501), so any UPnP fault past the first entry ends it; at the
-      // first entry only the "no such entry" codes mean an empty table, and
-      // anything else means the table could not be read.
+      // A router ends its table with a fault. 713 and 714 are the standard's
+      // "no such entry". Some routers answer 402 or 501 there instead, but
+      // those also mean "bad request", so they end a table only after at
+      // least one entry was read; at the first entry they prove nothing, and
+      // any other failure anywhere means the table could not be read.
       const code = Number(xmlValue(reply.text, 'errorCode'));
-      if (index === 0 && ![713, 714, 402].includes(code)) return null;
-      break;
+      if (code === 713 || code === 714) break;
+      if (index > 0 && (code === 402 || code === 501)) break;
+      return null;
     }
+    // A page that answers "200 OK" without being a mapping entry (a login
+    // page, a fault sent with the wrong status) is not a mapping: the table
+    // could not be read.
+    const portText = xmlValue(reply.text, 'NewExternalPort');
+    const externalPort = Number(portText);
+    // Port 0 is a wildcard entry, which some routers list.
+    if (!xmlValue(reply.text, 'NewProtocol') || !/^\d{1,5}$/.test(portText) || externalPort > 65535) return null;
     const internal = xmlValue(reply.text, 'NewInternalClient');
-    // A router that ignores the index would answer the same entry for ever.
-    const seen = ['NewExternalPort', 'NewProtocol', 'NewInternalPort', 'NewInternalClient', 'NewRemoteHost']
-      .map((tag) => xmlValue(reply.text, tag)).join('|');
-    if (seen === lastSeen) break;
-    lastSeen = seen;
+    // A table holds one entry per remote host, external port and protocol.
+    // The same three again means the router is ignoring the index, or going
+    // round in circles: the table has been read.
+    const key = ['NewRemoteHost', 'NewExternalPort', 'NewProtocol'].map((tag) => xmlValue(reply.text, tag)).join('|');
+    if (seen.has(key)) break;
+    seen.add(key);
     mappings.push({
       label: `<mapping-${index + 1}>`,
       protocol: xmlValue(reply.text, 'NewProtocol').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8),
@@ -385,22 +603,24 @@ async function readMappingTable(service, here, budgetMs = 20000) {
   return mappings;
 }
 
-async function checkUpnp(gateway) {
+async function checkUpnp({ gateway, src }) {
   try {
     // One silent search is not evidence that UPnP is off, so search twice.
-    let location = await discoverGateway(gateway);
+    let location = await discoverGateway(gateway, src);
     if (!location || location === 'other') {
-      const second = await discoverGateway(gateway);
+      const second = await discoverGateway(gateway, src);
       location = second && second !== 'other' ? second : (location || second);
     }
     if (!location) return { state: 'no-answer', mappings: [] };
     if (location === 'other') return { state: 'refused', mappings: [] };
 
-    const description = await request(location);
-    const service = description.status === 200 ? findMappingService(description.text, location, gateway) : null;
+    const description = await request(location, { localAddress: src });
+    // What came back has to be a UPnP device description, or it is not read.
+    const isDescription = description.status === 200 && description.text.includes('urn:schemas-upnp-org:device');
+    const service = isDescription ? findMappingService(description.text, location, gateway) : null;
     if (!service) return { state: 'unknown', mappings: [] };
 
-    const mappings = await readMappingTable(service, await localAddressFor(gateway));
+    const mappings = await readMappingTable(service, src, 20000, src);
     if (!mappings) return { state: 'unknown', mappings: [] };
     return { state: 'detected', mappings };
   } catch {
@@ -414,8 +634,12 @@ function classifySecurity(text) {
   const s = text.toUpperCase().trim();
   // NetworkManager shows an open network as an empty field or "--".
   if (!s || s === '--') return 'weak';
-  const modern = /WPA2|WPA3|RSN|SAE/.test(s);
-  if (/WEP|TKIP|OPEN|NONE/.test(s) || (/WPA/.test(s) && !modern)) return 'weak';
+  const words = s.split(/[\s,/]+/);
+  const modern = words.some((w) => /^(WPA2|WPA3|RSN|SAE)/.test(w));
+  const firstWpa = words.some((w) => w === 'WPA' || w === 'WPA1');
+  if (words.some((w) => /^(WEP|TKIP|OPEN|NONE)/.test(w)) || (firstWpa && !modern)) return 'weak';
+  // WPA2 with the first WPA still switched on accepts the old, broken mode.
+  if (modern && firstWpa) return 'legacy';
   if (modern) return 'strong';
   return 'review';
 }
@@ -448,9 +672,13 @@ async function checkWps(iface) {
 // The Wi-Fi this computer is on, from NetworkManager. Network names are read
 // only to tell this network's own access points from the neighbours'; they
 // are compared in memory and never printed or saved.
-async function checkWifi(gateway) {
+async function checkWifi(route, routerMac, rescan = true) {
+  const { gateway } = route;
   const result = { state: 'unknown', security: 'unknown', sameChannelNeighbours: null, wps: 'unknown' };
-  const list = await run('nmcli', ['-t', '-f', 'IN-USE,CHAN,SECURITY,DEVICE,SSID', 'device', 'wifi', 'list'], 20000);
+  // NetworkManager may make the Wi-Fi card look for networks again before it
+  // answers. The background check asks for the list it already has instead.
+  const list = await run('nmcli', ['-t', '-f', 'IN-USE,CHAN,SECURITY,DEVICE,SSID', 'device', 'wifi', 'list',
+    '--rescan', rescan ? 'auto' : 'no'], 20000);
   if (!list.trim()) {
     // No list: either no Wi-Fi hardware, the radio is off, or no nmcli.
     const radio = (await run('nmcli', ['radio', 'wifi'])).trim();
@@ -466,14 +694,27 @@ async function checkWifi(gateway) {
   // The Wi-Fi may be joined to a different network than the one the cable
   // leads to. Its results describe the audited router only when the Wi-Fi's
   // own gateway is that same router.
-  const wifiRoutes = /^[A-Za-z0-9_.-]{1,32}$/.test(current.device)
-    ? await run('ip', ['-4', 'route', 'show', 'default', 'dev', current.device]) : '';
-  const sameRouter = wifiRoutes.split('\n').some((line) => /\bvia (\S+)/.exec(line)?.[1] === gateway);
+  // "Same" means the same hardware, not just the same address: a neighbour's
+  // network very often uses the same 192.168 address for its own router.
+  let sameRouter = current.device === route.dev;
+  if (!sameRouter && /^[A-Za-z0-9_.-]{1,32}$/.test(current.device)) {
+    const wifiRoutes = await run('ip', ['-4', 'route', 'show', 'default', 'dev', current.device]);
+    const sameAddress = wifiRoutes.split('\n').some((line) => /\bvia (\S+)/.exec(line)?.[1] === gateway);
+    const viaWifi = sameAddress ? (await gatewayNeighbour(gateway, current.device)).mac : '';
+    // Same address, but this computer has not spoken to the router over the
+    // Wi-Fi lately: it cannot be told whose router that is.
+    if (sameAddress && (!viaWifi || !routerMac)) return { ...result, state: 'unconfirmed' };
+    sameRouter = Boolean(viaWifi) && viaWifi === routerMac;
+  }
   if (!sameRouter) return { ...result, state: 'other-network' };
 
   result.security = classifySecurity(current.security);
   result.wps = await checkWps(current.device);
-  if (current.channel) {
+  // A list that holds nothing but this network's own access points is not
+  // evidence of an empty channel when it was not freshly gathered: the card
+  // may simply not have looked lately.
+  const sawOthers = networks.some((n) => !n.inUse && n.name !== current.name);
+  if (current.channel && (rescan || sawOthers)) {
     result.sameChannelNeighbours = networks.filter(
       (n) => !n.inUse && n.device === current.device && n.channel === current.channel && n.name !== current.name,
     ).length;
@@ -488,6 +729,49 @@ async function checkWifi(gateway) {
 // lookups (systemd-resolved, as Omarchy's DNS setting configures it). That
 // says nothing about other devices at home; a router that encrypts DNS for
 // everyone is something only the owner can declare.
+// What `resolvectl status` says about DNS over TLS on the links that carry
+// lookups: 'encrypted' only in strict mode, where a server that cannot do
+// TLS means no answer at all; 'opportunistic' when TLS is tried but the
+// resolver may fall back to plain text without saying so, whichever server is
+// configured; 'plaintext' when TLS is off; 'unknown' when it cannot be read.
+function classifyDns(status) {
+  const text = String(status);
+  // Programs that read /etc/resolv.conf themselves only go through
+  // systemd-resolved in "stub" mode. In any other mode they may talk to the
+  // DNS servers directly, in plain text, whatever the resolver is set to.
+  const mode = /^\s*resolv\.conf mode:\s*(\S+)/m.exec(text)?.[1];
+  if (mode && mode !== 'stub') return 'unknown';
+
+  const scopes = [];
+  let field = '';
+  for (const line of text.split('\n')) {
+    if (/^(Global|Link \d+)/.test(line)) {
+      field = '';
+      scopes.push({ global: line.startsWith('Global'), protocols: '', servers: false, everything: false });
+      continue;
+    }
+    const scope = scopes.at(-1);
+    if (!scope) continue;
+    // A long value runs on to further lines, which carry no label of their own.
+    const label = /^\s*([A-Za-z][A-Za-z. ]*):/.exec(line)?.[1];
+    if (label) field = label.trim();
+    if (label && field === 'Protocols') scope.protocols = line;
+    if (label && field === 'DNS Servers') scope.servers = true;
+    // The routing domain "~." sends every lookup to this link.
+    if (field === 'DNS Domain' && /(^|[\s:])~\.(\s|$)/.test(line)) scope.everything = true;
+  }
+  // Lookups go to the links that carry the default route, and to the global
+  // servers when there are any; with neither, the global setting decides.
+  const links = scopes.filter((scope) => !scope.global && (scope.everything || /\+DefaultRoute/.test(scope.protocols)));
+  const global = scopes.find((scope) => scope.global && scope.protocols);
+  const relevant = [...links];
+  if (global && (global.servers || !links.length)) relevant.push(global);
+  if (!relevant.length) return 'unknown';
+  if (relevant.every((scope) => /\+DNSOverTLS|DNSOverTLS=yes/.test(scope.protocols))) return 'encrypted';
+  if (relevant.every((scope) => /\+DNSOverTLS|DNSOverTLS=(yes|opportunistic)/.test(scope.protocols))) return 'opportunistic';
+  return 'plaintext';
+}
+
 async function checkDns(choice) {
   if (choice !== 'auto') {
     return {
@@ -496,27 +780,16 @@ async function checkDns(choice) {
       basis: choice === 'unknown' ? 'No explicit evidence supplied.' : 'Declared by the owner.',
     };
   }
-  const status = await run('resolvectl', ['status']);
-  const protocols = status.split('\n').filter((line) => /^\s*Protocols:/.test(line));
-  if (!protocols.length) return { status: 'unknown', source: 'none', basis: 'This computer\'s resolver could not be read.' };
-  // The links that carry lookups; fall back to the global line.
-  const routed = protocols.filter((line) => /\+DefaultRoute/.test(line));
-  const relevant = routed.length ? routed : protocols.slice(0, 1);
-  const strict = relevant.every((line) => /\+DNSOverTLS|DNSOverTLS=yes/.test(line));
-  const opportunistic = relevant.every((line) => /\+DNSOverTLS|DNSOverTLS=(yes|opportunistic)/.test(line));
-  // "Opportunistic" falls back to unencrypted when a server cannot do TLS.
-  // It counts as encrypted only with servers configured by name for TLS
-  // (1.1.1.1#cloudflare-dns.com), which is how Omarchy's DNS setting writes
-  // them; with whatever servers the network handed out, it proves nothing.
-  const named = /^\s*DNS Servers:.*#/m.test(status);
-  if (!strict && opportunistic && !named) {
-    return { status: 'unknown', source: 'none', basis: 'DNS over TLS is opportunistic with unnamed servers; encryption is not assured.' };
-  }
-  return {
-    status: strict || opportunistic ? 'encrypted' : 'plaintext',
-    source: 'measured',
-    basis: 'Measured on this computer (systemd-resolved, DNS over TLS).',
-  };
+  const status = classifyDns(await run('resolvectl', ['status']));
+  if (status === 'unknown') return { status, source: 'none', basis: 'This computer\'s resolver could not be read.' };
+  return { status, source: 'measured', basis: 'Measured on this computer (systemd-resolved, DNS over TLS).' };
+}
+
+// A declaration ("my router encrypts DNS") is about one network. Anywhere
+// else it does not apply, and DNS is measured instead.
+function dnsChoiceFor(opts, currentNetwork) {
+  if (opts.dns === 'auto' || opts.dns === 'unknown') return opts.dns;
+  return opts.dnsNetwork && currentNetwork === opts.dnsNetwork ? opts.dns : 'auto';
 }
 
 // ---------- sanitizing ----------
@@ -545,7 +818,10 @@ function scoreChecks(checks) {
     const n = checks.wifi.sameChannelNeighbours;
     add(10, n === 0 ? 10 : n <= 2 ? 5 : 0);
   }
-  if (checks.dns.status !== 'unknown') add(20, checks.dns.status === 'encrypted' ? 20 : 0);
+  // Opportunistic encryption can fall back to plain text, so it earns half.
+  if (checks.dns.status !== 'unknown') {
+    add(20, checks.dns.status === 'encrypted' ? 20 : checks.dns.status === 'opportunistic' ? 10 : 0);
+  }
 
   return {
     provisional: known ? Math.round((earned / known) * 100) : null,
@@ -609,6 +885,10 @@ function buildFindings(checks) {
     findings.push({ id: 'wifi-security', severity: 'HIGH', state: 'weak', actionId: 'wifi-wpa',
       summary: 'The Wi-Fi uses weak or no encryption.',
       action: 'Switch the Wi-Fi to WPA2-AES or WPA3 in the router.' });
+  } else if (wifi.security === 'legacy') {
+    findings.push({ id: 'wifi-security', severity: 'LOW', state: 'legacy', actionId: 'wifi-wpa',
+      summary: 'The Wi-Fi still accepts the first version of WPA beside WPA2.',
+      action: 'Switch the Wi-Fi to WPA2-AES or WPA3 in the router.' });
   } else if (wifi.security === 'review') {
     findings.push({ id: 'wifi-security', severity: 'REVIEW', state: 'review', actionId: 'wifi-check',
       summary: 'The Wi-Fi security mode could not be classified.',
@@ -617,12 +897,15 @@ function buildFindings(checks) {
     findings.push({ id: 'wifi-security', severity: 'INFO', state: 'strong', summary: 'The Wi-Fi uses WPA2 or WPA3.' });
   } else {
     findings.push({ id: 'wifi-security', severity: 'INFO',
-      state: wifi.state === 'not-on-wifi' ? 'unknown-wired' : wifi.state === 'other-network' ? 'unknown-other' : 'unknown',
+      state: wifi.state === 'not-on-wifi' ? 'unknown-wired' : wifi.state === 'other-network' ? 'unknown-other'
+        : wifi.state === 'unconfirmed' ? 'unknown-unconfirmed' : 'unknown',
       summary: wifi.state === 'not-on-wifi'
         ? 'Unknown: this computer is not connected over Wi-Fi, so Wi-Fi was not checked.'
         : wifi.state === 'other-network'
           ? 'Unknown: the Wi-Fi this computer is on belongs to a different network than the router being audited.'
-          : 'Unknown: Wi-Fi security could not be read.' });
+          : wifi.state === 'unconfirmed'
+            ? 'Unknown: it could not be confirmed that the Wi-Fi this computer is on belongs to the router being audited.'
+            : 'Unknown: Wi-Fi security could not be read.' });
   }
 
   if (wifi.wps === 'on') {
@@ -659,6 +942,10 @@ function buildFindings(checks) {
       action: measured
         ? 'Choose an encrypted DNS provider for this computer, or turn on encrypted DNS in the router.'
         : 'Turn on DNS over TLS or DNS over HTTPS in the router or on your devices.' });
+  } else if (dns.status === 'opportunistic') {
+    findings.push({ id: 'dns', severity: 'LOW', state: 'opportunistic', actionId: 'dns-strict',
+      summary: 'This computer encrypts DNS lookups when the server allows it, but can fall back to unencrypted without warning.',
+      action: 'For assured encryption, set systemd-resolved to strict DNS over TLS (DNSOverTLS=yes) with a server that supports it.' });
   } else if (dns.status === 'encrypted') {
     const measured = dns.source === 'measured';
     findings.push({ id: 'dns', severity: 'INFO', state: measured ? 'encrypted-measured' : 'encrypted-declared',
@@ -722,8 +1009,9 @@ function changedFacts(before, after) {
 
 async function runAudit(opts, route, neighbour) {
   const { gateway } = route;
+  const network = networkId(neighbour.mac);
   const [tcp, upnp, wifi, dns] = await Promise.all([
-    checkPorts(gateway, neighbour.alive), checkUpnp(gateway), checkWifi(gateway), checkDns(opts.dns),
+    checkPorts(route), checkUpnp(route), checkWifi(route, neighbour.mac, !opts.cachedWifi), checkDns(dnsChoiceFor(opts, network)),
   ]);
 
   const checks = {
@@ -742,7 +1030,7 @@ async function runAudit(opts, route, neighbour) {
     network: redactIPv4(gateway),
     // A scrambled id of the router, so a later scan can tell whether it is
     // looking at the same network. Empty when the router's address is unknown.
-    networkId: networkId(neighbour.mac),
+    networkId: network,
     checks,
     score: scoreChecks(checks),
     findings,
@@ -763,15 +1051,30 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
+// Written beside the report and renamed over it, so a reader never sees half
+// a file. The report describes the owner's network: only the owner may read it.
+function writeReport(report) {
+  const partial = `${REPORT}.${process.pid}.tmp`;
+  fs.writeFileSync(partial, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(partial, REPORT);
+}
+
 // Saves the report and returns what changed since the one before it.
 function saveSanitizedReport(report) {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(STATE_DIR, 0o700); } catch { /* not ours to change */ }
+  for (const name of fs.readdirSync(STATE_DIR)) {
+    if (/\.\d+\.tmp$/.test(name)) { try { fs.unlinkSync(path.join(STATE_DIR, name)); } catch { /* in use */ } }
+  }
   const previous = readJson(REPORT);
   let changes = [];
   // A report from another network (a different home, an office) is not a
   // "before" for this one: no score comparison, no changes.
   const sameNetwork = Boolean(previous && report.networkId && previous.networkId === report.networkId);
-  if (previous) fs.copyFileSync(REPORT, PREVIOUS);
+  if (previous) {
+    fs.copyFileSync(REPORT, PREVIOUS);
+    try { fs.chmodSync(PREVIOUS, 0o600); } catch { /* best effort */ }
+  }
   if (sameNetwork) {
     if (previous.score?.provisional != null && report.score.provisional != null) {
       report.comparison = {
@@ -787,11 +1090,7 @@ function saveSanitizedReport(report) {
       ? { at: report.generatedAt, items: changes }
       : previous.lastChange ?? null;
   }
-  // Written beside the report and renamed over it, so a reader never sees
-  // half a file.
-  const partial = `${REPORT}.${process.pid}.tmp`;
-  fs.writeFileSync(partial, `${JSON.stringify(report, null, 2)}\n`);
-  fs.renameSync(partial, REPORT);
+  writeReport(report);
   return changes;
 }
 
@@ -804,7 +1103,7 @@ const FACT_NAMES = {
 };
 const VALUE_NAMES = {
   'not-reachable': 'not reachable', detected: 'on', 'no-answer': 'no answer', refused: 'another device',
-  review: 'unclear', few: 'a few neighbours', plaintext: 'unencrypted',
+  review: 'unclear', few: 'a few neighbours', plaintext: 'unencrypted', opportunistic: 'encrypted when possible',
 };
 
 function describeChange({ key, from, to }) {
@@ -844,6 +1143,28 @@ function printReport(report) {
   console.log(`\nSaved: ${REPORT}`);
 }
 
+// Applies the DNS choice to the saved report and saves it again. Nothing is
+// sent anywhere: the other checks are kept exactly as the last scan left
+// them, and DNS is either the owner's declaration or this computer's own
+// resolver setting. This is what the widget's DNS links do, so that a click
+// on a DNS link can never turn into a scan.
+async function rescoreSaved(opts) {
+  const report = readJson(REPORT);
+  if (!report?.checks?.tcp) throw new Error('There is no saved report to update. Scan first.');
+  report.checks.dns = await checkDns(dnsChoiceFor(opts, report.networkId || ''));
+  report.score = scoreChecks(report.checks);
+  report.findings = buildFindings(report.checks);
+  const fixes = topFixes(report.findings);
+  report.topFixes = fixes.map((f) => f.action);
+  report.topFixIds = fixes.map((f) => f.actionId ?? '');
+  if (report.comparison && typeof report.comparison.previousScore === 'number' && report.score.provisional != null) {
+    report.comparison.currentScore = report.score.provisional;
+    report.comparison.delta = report.score.provisional - report.comparison.previousScore;
+  }
+  writeReport(report);
+  return report;
+}
+
 // One audit. Resolves with null when --only-network names another network
 // than the one this computer is on, in which case nothing was scanned.
 async function auditOnce(opts) {
@@ -851,6 +1172,13 @@ async function auditOnce(opts) {
   const neighbour = await gatewayNeighbour(route.gateway, route.dev);
   if (opts.onlyNetwork && networkId(neighbour.mac) !== opts.onlyNetwork) return null;
   const report = await runAudit(opts, route, neighbour);
+  // A VPN can come up, or the cable be moved, while a scan runs. The route is
+  // looked up again, and if anything about it has changed the results are
+  // thrown away: they may be about something else than was checked.
+  const after = await findRoute();
+  if (after.gateway !== route.gateway || after.dev !== route.dev || after.src !== route.src) {
+    throw new Error('Safety stop: the network changed during the scan, so nothing was saved.');
+  }
   const changes = saveSanitizedReport(report);
   if (opts.notify && changes.length) await notify(changes, report);
   return { report, changes };
@@ -888,7 +1216,8 @@ async function watch(opts) {
 
 // The pieces the tests exercise. Nothing here scans by being imported.
 export {
-  isPrivateGateway, classifySecurity, classifyPorts, terseFields, xmlValue, findMappingService,
+  isPrivateGateway, isHomeLink, routerUrl, asciiLower, classifySecurity, classifyPorts, classifyDns,
+  dnsChoiceFor, parseRouteGet, defaultRouteDevices, terseFields, xmlValue, findMappingService,
   readMappingTable, request, redactIPv4, scoreChecks, buildFindings, facts, changedFacts,
   describeChange, parseArgs,
 };
@@ -896,7 +1225,10 @@ export {
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   try {
     const opts = parseArgs(process.argv.slice(2));
-    if (opts.printNetwork) {
+    if (opts.rescore) {
+      const report = await rescoreSaved(opts);
+      if (!opts.quiet) printReport(report);
+    } else if (opts.printNetwork) {
       // For the helper: which network is this? Prints nothing when the
       // router's address is not known.
       const route = await findRoute();
