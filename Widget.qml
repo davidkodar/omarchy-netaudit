@@ -33,8 +33,14 @@ Panel {
   property int watchMinutes: 30
 
   property var report: null
-  property string error: ""
-  property bool scanning: false
+  // A failed scan stays on show until a scan succeeds; rereading the saved
+  // report must not wipe it, or an old score would pass for a current one.
+  property string scanError: ""
+  property string readError: ""
+  readonly property string error: scanError !== "" ? scanError : readError
+  readonly property bool scanning: scanProc.running || autoProc.running
+  // A scan asked for while the background check is running; started when it ends.
+  property bool scanWanted: false
   // Whether the "how to read this" notes are showing in the popup.
   property bool showInfo: false
 
@@ -196,21 +202,30 @@ Panel {
     return { title: strings.t("change.line").arg(when), lines: lines }
   }
 
-  function take(text) {
-    try {
-      const parsed = JSON.parse(text)
-      if (parsed && parsed.error) { root.error = clip(parsed.error, 200); return }
-      root.error = ""
-      root.report = parsed && parsed.findings ? parsed : null
-    } catch (e) {
-      root.error = strings.t("error.unreadable")
+  // `fromScan` is true for the answer to a scan, false for a plain reread.
+  function take(text, fromScan) {
+    let parsed = null
+    try { parsed = JSON.parse(text) } catch (e) {}
+    const failed = !parsed || typeof parsed !== "object" || parsed.error !== undefined
+    if (fromScan) {
+      // An answer with an "error" key is a failure even when the text is empty.
+      root.scanError = !failed ? "" : (parsed && clip(parsed.error, 200)) || strings.t("error.scanFailed")
+      if (failed) return
+    } else {
+      root.readError = failed ? strings.t("error.unreadable") : ""
+      if (failed) return
     }
+    // A missing report ("{}") is "no scan yet"; it never replaces a report on
+    // show after a failed scan.
+    if (parsed.findings) root.report = parsed
+    else if (!fromScan && root.scanError === "") root.report = null
   }
 
   function takeSettings(text) {
     try {
       const s = JSON.parse(text)
-      if (!s || s.error) return
+      if (!s) return
+      if (s.error) { root.scanError = clip(s.error, 200); return }
       root.dnsChoice = s.dns === "encrypted" ? "encrypted" : "auto"
       root.watching = s.watch === true
       root.watchMinutes = Math.max(5, Math.min(1440, Number(s.watchMinutes) || 30))
@@ -226,7 +241,10 @@ Panel {
   }
 
   function scan() {
-    if (!scanProc.running && !autoProc.running) scanProc.running = true
+    if (scanProc.running) return
+    // The background check holds the scan lock; queue behind it.
+    if (autoProc.running) { root.scanWanted = true; return }
+    scanProc.running = true
   }
 
   // Changes one of the owner's choices; a DNS change is followed by a scan so
@@ -250,14 +268,13 @@ Panel {
   Process {
     id: readProc
     command: [root.helperPath, "report"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text) }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, false) }
   }
 
   Process {
     id: scanProc
     command: [root.helperPath, "scan"]
-    onRunningChanged: root.scanning = running
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text) }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, true) }
   }
 
   // The background check. The helper does nothing unless watching is on and
@@ -266,7 +283,10 @@ Panel {
   Process {
     id: autoProc
     command: [root.helperPath, "scan", "auto"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text) }
+    // Its answer is the saved report either way, so it is read as a reread:
+    // a background failure must not put an error in front of the owner.
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, false) }
+    onRunningChanged: if (!running && root.scanWanted) { root.scanWanted = false; root.scan() }
   }
 
   Process {
@@ -483,8 +503,16 @@ Panel {
               Item {
                 width: parent.width
                 height: problemName.height
-                Plain { id: problemName; font.bold: true; text: problem.modelData.name }
+                Plain {
+                  id: problemName
+                  width: Math.max(0, parent.width - problemSide.width - Style.space(10))
+                  wrapMode: Text.NoWrap
+                  elide: Text.ElideRight
+                  font.bold: true
+                  text: problem.modelData.name
+                }
                 Row {
+                  id: problemSide
                   anchors.right: parent.right
                   spacing: Style.space(12)
                   Plain { color: root.levelColor(problem.modelData.level); text: problem.modelData.brief }
@@ -531,9 +559,13 @@ Panel {
           Plain {
             id: lineName
             x: lineIcon.width + Style.space(8)
+            width: Math.max(0, line.width - x - lineSide.width - Style.space(10))
+            wrapMode: Text.NoWrap
+            elide: Text.ElideRight
             text: line.modelData.name
           }
           Row {
+            id: lineSide
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(12)

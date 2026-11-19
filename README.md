@@ -33,8 +33,8 @@ This plugin answers three questions without you opening the router:
 - **An explanation when you want one.** *Explain* hands a finding to your
   Omarchy default coding agent, which walks you through it for your router.
 - **A heads-up when something changes.** Switch on alerts and you get a
-  notification if a port opens, a device adds a UPnP mapping, or the Wi-Fi
-  security changes.
+  notification if a port opens, the number of UPnP mappings changes, or the
+  Wi-Fi security changes.
 - **No scare tactics.** A finding is a setting worth changing. It does not
   mean anyone has got in, and the popup says so.
 
@@ -79,12 +79,43 @@ All screenshots use made-up results.
 ## What it never does
 
 - It only ever looks at this computer's own default gateway, and only when
-  that is a private address. No option accepts another target.
+  that is a private address reached over cable or Wi-Fi. No option accepts
+  another target, and it refuses to run through a VPN or other tunnel.
+- It cannot know that the network you are on is yours. **Scan now** audits
+  the router of whatever network this computer is on, so press it only on a
+  network you own or are allowed to check. Alerts never scan any network but
+  the one they were switched on for.
 - It never logs in, sends credentials, reads banners or changes a setting.
 - "Reachable" always means reachable from this computer, inside your home. It
   says nothing about the internet.
 - The saved report holds no network names, hardware addresses, device names
-  or full IP addresses.
+  or full IP addresses. To tell one network from another it keeps a scrambled
+  id: a salted hash of the router's hardware address, never the address.
+
+## What it sends, and when
+
+Nothing leaves this computer until you press **Scan now**, or switch on
+alerts. Installing the plugin and opening the popup send nothing; the widget
+only rereads its saved report.
+
+One scan sends, all to your own router and nowhere else:
+
+- up to three connection attempts to each of ports 22, 23, 80, 443 and 7547,
+  closed as soon as they connect;
+- a UPnP search to the local multicast address `239.255.255.250:1900`, sent a
+  few times, and, only if the router answers, one request for its description
+  and one request per port-mapping entry.
+
+A scan also asks NetworkManager for its list of nearby Wi-Fi networks, which
+can make the Wi-Fi card rescan. Nothing in a scan contacts the internet.
+
+With alerts on, the same scan runs about every 30 minutes while the bar is
+running, and only on the network you switched them on for. On any other
+network, such as a cafe or an office, the background check does nothing.
+
+**Explain** and **Ask …** open your default coding agent in a terminal. From
+then on the agent talks to its own provider as it always does, and it is
+given the saved report to read.
 
 ## Requirements
 
@@ -116,7 +147,10 @@ sudo ufw allow in proto udp from 192.168.1.1 port 1900 comment 'UPnP replies fro
 This is the only step that needs administrator rights, and it is optional.
 
 **DNS is measured on this computer only.** If your router encrypts DNS for the
-whole home, click **My router encrypts it** on the DNS line.
+whole home, click **My router encrypts it** on the DNS line. Omarchy's own
+Cloudflare and Google settings count as encrypted. "Opportunistic" encryption
+with whatever DNS servers the network handed out does not, because it falls
+back to unencrypted without saying so.
 
 **The agent buttons start your default agent the way Omarchy does**: in a
 terminal, in its auto-approve mode, in a folder that holds only the report.
@@ -124,8 +158,14 @@ The prompt tells it to read the report and change nothing, but that is an
 instruction, not a lock. If no default agent is set, the button opens
 Omarchy's picker.
 
-**Alerts are off until you switch them on.** When on, the widget rescans every
-30 minutes and sends a desktop notification if a check changed.
+**Alerts are off until you switch them on.** When on, the widget rescans
+about every 30 minutes and sends a desktop notification if a check changed.
+Alerts belong to the network you were on when you switched them on; to move
+them to another network, switch them off and on again there.
+
+**"Not measured" is never a pass.** If the router does not answer at all, its
+ports are listed as not measured, and a UPnP search that gets no reply is not
+taken to mean UPnP is off. Neither earns points, and neither raises an alert.
 
 ## Settings
 
@@ -164,8 +204,8 @@ best, and a scan that measured under 60% never shows green.
 
 | Path | What |
 |---|---|
-| `~/.local/state/netaudit/` | The latest report and the one before it |
-| `~/.config/netaudit/settings` | Your two choices: DNS declared by you, alerts on or off |
+| `~/.local/state/netaudit/` | The latest report, the one before it, and a random `salt` used to scramble the network id |
+| `~/.config/netaudit/settings` | Your choices (DNS declared by you, alerts on or off) and the scrambled id of the network alerts are for |
 
 ## Remove
 

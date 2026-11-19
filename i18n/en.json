@@ -113,8 +113,8 @@
   "button.chooseTip": "No default agent is set yet; this opens the picker",
   "watch.label": "Alert me when something changes",
   "watch.detail": {
-    "one": "Rescans every minute and sends a notification.",
-    "other": "Rescans every %1 minutes and sends a notification."
+    "one": "Rescans this network about every minute and notifies you.",
+    "other": "Rescans this network about every %1 minutes and notifies you."
   },
   "info.show": "How to read this",
   "info.hide": "Hide the notes",
@@ -169,5 +169,12 @@
     "other": "%1 neighbours"
   },
   "short.dns.plaintext-measured": "Unencrypted",
-  "short.dns.plaintext-declared": "Unencrypted"
+  "short.dns.plaintext-declared": "Unencrypted",
+  "finding.tcp-22.unknown": "Unknown: the router did not answer, so this could not be checked.",
+  "finding.tcp-23.unknown": "Unknown: the router did not answer, so this could not be checked.",
+  "finding.tcp-80.unknown": "Unknown: the router did not answer, so this could not be checked.",
+  "finding.tcp-7547.unknown": "Unknown: the router did not answer, so this could not be checked.",
+  "finding.wifi-security.unknown-other": "Unknown: the Wi-Fi this computer is on belongs to a different network than the router being audited.",
+  "short.wifi-security.unknown-other": "Different network",
+  "error.scanFailed": "The scan did not finish."
 }

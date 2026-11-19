@@ -3,8 +3,9 @@
 #   netaudit report            print the last saved report
 #   netaudit scan              run the audit, then print the new report
 #   netaudit scan auto         the background check: only when watching is on,
-#                              only if the report is older than 30 minutes, and
-#                              with a desktop notification when something changed
+#                              only on the network it was switched on for, only
+#                              if the report is older than 30 minutes, and with
+#                              a desktop notification when something changed
 #   netaudit settings          print the widget's settings and the default agent
 #   netaudit set dns <auto|encrypted>
 #   netaudit set watch <on|off>
@@ -25,16 +26,16 @@ watch_minutes=30
 
 setting() {
   local value=""
-  [[ -r $settings ]] && value=$(grep -m1 "^$1=" "$settings" 2>/dev/null | cut -d= -f2 | tr -cd 'a-z')
+  [[ -r $settings ]] && value=$(grep -m1 "^$1=" "$settings" 2>/dev/null | cut -d= -f2 | tr -cd 'a-z0-9' | cut -c1-32)
   echo "${value:-$2}"
 }
 
 save_setting() {
   mkdir -p "$settings_dir"
-  local dns watch
-  dns=$(setting dns auto); watch=$(setting watch off)
-  case "$1" in dns) dns=$2 ;; watch) watch=$2 ;; esac
-  printf 'dns=%s\nwatch=%s\n' "$dns" "$watch" >"$settings"
+  local dns watch home
+  dns=$(setting dns auto); watch=$(setting watch off); home=$(setting home "")
+  case "$1" in dns) dns=$2 ;; watch) watch=$2 ;; home) home=$2 ;; esac
+  printf 'dns=%s\nwatch=%s\nhome=%s\n' "$dns" "$watch" "$home" >"$settings"
 }
 
 default_agent() {
@@ -73,7 +74,18 @@ case "${1:-report}" in
     ;;
   set)
     case "${2:-}:${3:-}" in
-      dns:auto | dns:encrypted | watch:on | watch:off) save_setting "$2" "$3" ;;
+      dns:auto | dns:encrypted | watch:off) save_setting "$2" "$3" ;;
+      watch:on)
+        # Alerts belong to the network they were switched on for. Remember
+        # which one that is (a scrambled id, not the router's address), so a
+        # laptop taken to a cafe or an office never scans that network unasked.
+        node=$(find_node) || { echo '{"error":"Node.js was not found"}'; exit 1; }
+        home=$(timeout 30 "$node" "$scanner" --network-id 2>/dev/null | tr -cd 'a-f0-9' | cut -c1-16)
+        if [[ ${#home} -ne 16 ]]; then
+          echo '{"error":"This network could not be identified, so alerts stay off."}'; exit 1
+        fi
+        save_setting home "$home"; save_setting watch on
+        ;;
       *) echo '{"error":"Unknown setting"}'; exit 2 ;;
     esac
     print_settings
@@ -82,18 +94,21 @@ case "${1:-report}" in
     extra=()
     if [[ ${2:-} == auto ]]; then
       # Background checks are opt-in.
-      [[ $(setting watch off) == on ]] || { print_report; exit 0; }
-      extra=(--max-age "$watch_minutes" --notify)
+      home=$(setting home "")
+      [[ $(setting watch off) == on && ${#home} -eq 16 ]] || { print_report; exit 0; }
+      extra=(--max-age "$watch_minutes" --notify --only-network "$home")
     fi
     node=$(find_node) || { echo '{"error":"Node.js was not found"}'; exit 1; }
     # "auto" measures this computer's resolver; "encrypted" is the owner
     # saying the router encrypts DNS for the whole home.
     dns=$(setting dns auto)
-    # One scan at a time, across every bar and any watcher in a terminal.
+    # One scan at a time, across every bar.
     exec 9>"${XDG_RUNTIME_DIR:-/tmp}/netaudit.lock"
     flock -w 60 9 || { echo '{"error":"Another scan is still running"}'; exit 1; }
-    if ! output=$("$node" "$scanner" --quiet --dns "$dns" "${extra[@]}" 2>&1); then
-      printf '{"error":"%s"}\n' "$(printf '%s' "$output" | tail -1 | tr -d '"\\' | cut -c1-200)"
+    # A scan normally takes ten seconds; nothing may hold the lock for ever.
+    if ! output=$(timeout 150 "$node" "$scanner" --quiet --dns "$dns" "${extra[@]}" 2>&1); then
+      message=$(printf '%s' "$output" | tail -1 | tr -d '"\\' | tr -cd '[:print:]' | cut -c1-200)
+      printf '{"error":"%s"}\n' "${message:-The scan stopped before it finished.}"
       exit 1
     fi
     print_report
