@@ -1,0 +1,4 @@
+node_modules/
+*.log
+sanitized-report.json
+previous-sanitized-report.json

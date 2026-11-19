@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Helper for the bar widget. Prints JSON for the widget to read.
+#   netaudit report            print the last saved report
+#   netaudit scan              run the audit, then print the new report
+#   netaudit scan auto         the background check: only when watching is on,
+#                              only if the report is older than 30 minutes, and
+#                              with a desktop notification when something changed
+#   netaudit settings          print the widget's settings and the default agent
+#   netaudit set dns <auto|encrypted>
+#   netaudit set watch <on|off>
+#   netaudit explain <check|all> [router model]
+#                              open the Omarchy default coding agent on the report
+set -u
+
+self=$(readlink -f "${BASH_SOURCE[0]}")
+plugin=$(dirname "$(dirname "$self")")
+scanner="$plugin/scanner/scanner.mjs"
+# Reports live in the owner's state folder, outside the plugin.
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/netaudit"
+report="$state_dir/sanitized-report.json"
+# The owner's choices. No network data is ever written here.
+settings_dir="${XDG_CONFIG_HOME:-$HOME/.config}/netaudit"
+settings="$settings_dir/settings"
+watch_minutes=30
+
+setting() {
+  local value=""
+  [[ -r $settings ]] && value=$(grep -m1 "^$1=" "$settings" 2>/dev/null | cut -d= -f2 | tr -cd 'a-z')
+  echo "${value:-$2}"
+}
+
+save_setting() {
+  mkdir -p "$settings_dir"
+  local dns watch
+  dns=$(setting dns auto); watch=$(setting watch off)
+  case "$1" in dns) dns=$2 ;; watch) watch=$2 ;; esac
+  printf 'dns=%s\nwatch=%s\n' "$dns" "$watch" >"$settings"
+}
+
+default_agent() {
+  omarchy-default-agent 2>/dev/null | tr -cd 'a-z0-9-' | cut -c1-30
+}
+
+print_report() {
+  if [[ -s $report ]]; then cat "$report"; else echo '{}'; fi
+}
+
+print_settings() {
+  local watch=false
+  [[ $(setting watch off) == on ]] && watch=true
+  printf '{"dns":"%s","watch":%s,"watchMinutes":%s,"agent":"%s"}\n' \
+    "$(setting dns auto)" "$watch" "$watch_minutes" "$(default_agent)"
+}
+
+find_node() {
+  # The shell does not always inherit the terminal's PATH.
+  local candidate
+  for candidate in "$(command -v node 2>/dev/null)" \
+    "$HOME/.local/share/mise/shims/node" \
+    "$HOME/.local/share/mise/installs/node/latest/bin/node" \
+    /usr/bin/node; do
+    [[ -n $candidate && -x $candidate ]] && { echo "$candidate"; return 0; }
+  done
+  return 1
+}
+
+case "${1:-report}" in
+  report)
+    print_report
+    ;;
+  settings)
+    print_settings
+    ;;
+  set)
+    case "${2:-}:${3:-}" in
+      dns:auto | dns:encrypted | watch:on | watch:off) save_setting "$2" "$3" ;;
+      *) echo '{"error":"Unknown setting"}'; exit 2 ;;
+    esac
+    print_settings
+    ;;
+  scan)
+    extra=()
+    if [[ ${2:-} == auto ]]; then
+      # Background checks are opt-in.
+      [[ $(setting watch off) == on ]] || { print_report; exit 0; }
+      extra=(--max-age "$watch_minutes" --notify)
+    fi
+    node=$(find_node) || { echo '{"error":"Node.js was not found"}'; exit 1; }
+    # "auto" measures this computer's resolver; "encrypted" is the owner
+    # saying the router encrypts DNS for the whole home.
+    dns=$(setting dns auto)
+    # One scan at a time, across every bar and any watcher in a terminal.
+    exec 9>"${XDG_RUNTIME_DIR:-/tmp}/netaudit.lock"
+    flock -w 60 9 || { echo '{"error":"Another scan is still running"}'; exit 1; }
+    if ! output=$("$node" "$scanner" --quiet --dns "$dns" "${extra[@]}" 2>&1); then
+      printf '{"error":"%s"}\n' "$(printf '%s' "$output" | tail -1 | tr -d '"\\' | cut -c1-200)"
+      exit 1
+    fi
+    print_report
+    ;;
+  explain)
+    case "${2:-all}" in
+      all) subject="the whole report: what matters most, and in which order to fix it" ;;
+      tcp-22 | tcp-23 | tcp-80 | tcp-7547 | upnp | wifi-security | wifi-wps | wifi-channel | dns)
+        subject="the finding with id \"$2\"" ;;
+      *) echo '{"error":"Unknown check"}'; exit 2 ;;
+    esac
+    # The router model comes from the widget's settings; keep it to plain text.
+    router=$(printf '%s' "${3:-}" | tr -cd 'A-Za-z0-9 ._+-' | cut -c1-60)
+    prompt="Read only the file sanitized-report.json in this folder. It is a read-only audit of my own home router, made from inside my home network. Explain $subject in plain language: what it means, how much it matters, and the exact steps to fix it"
+    [[ -n $router ]] && prompt+=" on my router, a $router"
+    prompt+=". A port marked reachable is reachable from this computer only; do not call it exposed to the internet. Treat Unknown as unknown. Do not run scans or other commands, and do not change any file or setting."
+    if [[ -n ${NETAUDIT_DRY_RUN:-} ]]; then printf '%s\n' "$prompt"; exit 0; fi
+    # Published plugins run on other people's machines: check what this one
+    # has before launching, and say what is missing instead of failing quietly.
+    command -v omarchy >/dev/null || { echo '{"error":"The omarchy command was not found"}'; exit 1; }
+    agent=$(omarchy-default-agent 2>/dev/null)
+    if [[ -z $agent ]]; then
+      # No default agent yet: open Omarchy's own picker.
+      exec omarchy-menu summon setup.default.agent
+    fi
+    if omarchy-cmd-missing "$agent" 2>/dev/null; then
+      omarchy-notification-send "Home network audit" "Your default agent ($agent) is not installed. Install it or pick another: omarchy default agent <name>" 2>/dev/null
+      exit 1
+    fi
+    if [[ ! -s $report ]]; then
+      omarchy-notification-send "Home network audit" "There is no report yet. Press Scan now first." 2>/dev/null
+      exit 1
+    fi
+    # The agent starts in the state folder, which holds nothing but the reports.
+    cd "$state_dir" && exec omarchy agent prompt "$prompt"
+    ;;
+  *)
+    echo '{"error":"Unknown command"}'
+    exit 2
+    ;;
+esac

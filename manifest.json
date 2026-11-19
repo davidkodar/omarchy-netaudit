@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "davidkodar.netaudit",
+  "name": "Home network audit",
+  "version": "0.1.0",
+  "author": "davidkodar",
+  "license": "MIT",
+  "description": "Audits your own home router from the Omarchy bar: a score in the colour of its verdict, what to fix and how, and an alert when something changes. Read-only, and only ever your own default gateway.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Home network audit",
+    "description": "Home router audit score with what to fix, every check, and change alerts",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
