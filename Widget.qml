@@ -9,8 +9,9 @@ import qs.Ui
 // Home network audit in the bar: the last audit score of this computer's own
 // router, in the colour of its verdict. Clicking it opens a popup with what to
 // fix, every other check and a button to scan again. It scans by itself only
-// when the owner switches on "Alert me when something changes"; otherwise it
-// just rereads the saved report.
+// when the owner switches on "Alert me when something changes". Otherwise it
+// starts no process at all while idle: it watches its report and settings
+// files and rereads them when they change.
 Panel {
   id: root
   moduleName: "davidkodar.netaudit"
@@ -221,16 +222,25 @@ Panel {
     else if (!fromScan && root.scanError === "") root.report = null
   }
 
+  // The helper's answer to a change of setting. The values themselves arrive
+  // through the settings file; only a refusal needs showing.
   function takeSettings(text) {
     try {
       const s = JSON.parse(text)
-      if (!s) return
-      if (s.error) { root.scanError = clip(s.error, 200); return }
-      root.dnsChoice = s.dns === "encrypted" ? "encrypted" : "auto"
-      root.watching = s.watch === true
-      root.watchMinutes = Math.max(5, Math.min(1440, Number(s.watchMinutes) || 30))
-      root.agentName = word(s.agent)
+      if (s && s.error) root.scanError = clip(s.error, 200)
     } catch (e) {}
+    settingsFile.reload()
+  }
+
+  // The settings file: one key=value per line, written by the helper.
+  function readSettings(text) {
+    const values = {}
+    for (const line of String(text).slice(0, 2000).split("\n")) {
+      const m = /^([a-z]+)=([a-z0-9]*)$/.exec(line.trim())
+      if (m) values[m[1]] = m[2]
+    }
+    root.dnsChoice = values.dns === "encrypted" ? "encrypted" : "auto"
+    root.watching = values.watch === "on"
   }
 
   // Opens the Omarchy default coding agent in a terminal, on the saved report.
@@ -266,15 +276,45 @@ Panel {
   }
 
   Process {
-    id: readProc
-    command: [root.helperPath, "report"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, false) }
-  }
-
-  Process {
     id: scanProc
     command: [root.helperPath, "scan"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, true) }
+  }
+
+  // The report, the settings and Omarchy's default agent, read straight from
+  // their files and reread when a file changes. No process is started for any
+  // of this, so an idle bar costs nothing.
+  readonly property string homeDir: Quickshell.env("HOME") || ""
+  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || homeDir + "/.local/state") + "/netaudit"
+  readonly property string configDir: (Quickshell.env("XDG_CONFIG_HOME") || homeDir + "/.config")
+
+  FileView {
+    id: reportFile
+    path: root.stateDir + "/sanitized-report.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.take(text(), false)
+    // No report file is "no scan yet", not an error.
+    onLoadFailed: root.take("{}", false)
+  }
+  FileView {
+    id: settingsFile
+    path: root.configDir + "/netaudit/settings"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.readSettings(text())
+    onLoadFailed: root.readSettings("")
+  }
+  FileView {
+    id: agentFile
+    path: root.configDir + "/omarchy/defaults/agent"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.agentName = root.word(text().trim())
+    onLoadFailed: root.agentName = ""
   }
 
   // The background check. The helper does nothing unless watching is on and
@@ -286,13 +326,11 @@ Panel {
     // Its answer is the saved report either way, so it is read as a reread:
     // a background failure must not put an error in front of the owner.
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.take(text, false) }
-    onRunningChanged: if (!running && root.scanWanted) { root.scanWanted = false; root.scan() }
-  }
-
-  Process {
-    id: settingsProc
-    command: [root.helperPath, "settings"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.takeSettings(text) }
+    onRunningChanged: {
+      if (running) return
+      reportFile.reload()
+      if (root.scanWanted) { root.scanWanted = false; root.scan() }
+    }
   }
 
   Process {
@@ -307,30 +345,31 @@ Panel {
     }
   }
 
-  // Reread the saved report and the settings once a minute, and at once when
-  // the popup opens.
+  // When the background check last ran, so that on a network where it does
+  // nothing (anywhere but home) it is not started again every minute.
+  property real autoTriedAt: 0
+
+  // While alerts are on, look once a minute whether a scan is due. That look
+  // is a comparison of two times; a process is started only when the report
+  // is older than the interval, which is once per interval.
   Timer {
     interval: 60000
-    running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: {
-      if (!readProc.running && !scanProc.running && !autoProc.running) readProc.running = true
-      if (!settingsProc.running) settingsProc.running = true
-    }
-  }
-  // While watching is on, ask the helper every five minutes whether a scan is
-  // due.
-  Timer {
-    interval: 300000
     running: root.watching
     repeat: true
-    onTriggered: if (!scanProc.running && !autoProc.running) autoProc.running = true
+    onTriggered: {
+      const every = root.watchMinutes * 60000
+      const scanned = root.report ? Date.parse(root.report.generatedAt) : 0
+      const now = Date.now()
+      if (now - (scanned || 0) < every || now - root.autoTriedAt < every) return
+      if (scanProc.running || autoProc.running) return
+      root.autoTriedAt = now
+      autoProc.running = true
+    }
   }
+  // Opening the popup rereads everything, in case a change was missed.
   onOpenedChanged: {
     if (!opened) { root.showInfo = false; return }
-    if (!readProc.running && !scanProc.running && !autoProc.running) readProc.running = true
-    if (!settingsProc.running) settingsProc.running = true
+    reportFile.reload(); settingsFile.reload(); agentFile.reload()
   }
 
   WidgetButton {

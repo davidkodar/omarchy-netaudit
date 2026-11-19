@@ -95,8 +95,9 @@ All screenshots use made-up results.
 ## What it sends, and when
 
 Nothing leaves this computer until you press **Scan now**, or switch on
-alerts. Installing the plugin and opening the popup send nothing; the widget
-only rereads its saved report.
+alerts. Installing the plugin and opening the popup send nothing. While idle
+the widget starts no process at all: it watches its saved report and settings
+files and rereads them when they change.
 
 One scan sends, all to your own router and nowhere else:
 
